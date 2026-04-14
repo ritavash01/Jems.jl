@@ -331,9 +331,12 @@ function gammaTurb(sm::StellarModel, k::Int)
 ###Constants###
 C_d = 8/3 * sqrt(2/3)
 α_w = 0.25 
+# Numerically cap |γ| smoothly so exp(γ) does not drive unstable extremes in low-density layers.
 γ_lim = 12.0
 
+# Smoothly bounded γ used in all gamma_turb source/dissipation terms.
 @inline smooth_gamma(γ) = γ_lim * tanh(γ / γ_lim)
+# Stabilized mapping from γ -> ω = exp(γ).
 @inline omega_from_gamma(γ) = exp(smooth_gamma(γ))
 
 
