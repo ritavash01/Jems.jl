@@ -3,6 +3,7 @@ using ForwardDiff
 
 const INV_LN10 = 0.4342944819032518
 const _OPACITY_OFFSETS = (-1, 0, 1, 2)
+# Species indices are cached by species vector identity to avoid repeated symbol scans in hot paths.
 const _SPECIES_INDEX_CACHE_LOCK = ReentrantLock()
 const _SPECIES_INDEX_CACHE = Dict{UInt64,NTuple{2,Int}}()
 

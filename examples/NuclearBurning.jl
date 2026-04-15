@@ -38,10 +38,11 @@ function benchmark_opacity_eval(sm::StellarModel; zone::Int=1)
     xa = @view sm.props.xa_dual[i, :]
     species = sm.network.species_names
 
-    per_call_seconds = @belapsed Jems.Opacity.get_opacity_resultsTρ($sm.opacity, $lnT, $lnρ, $xa, $species)
-    per_call_alloc = @allocated Jems.Opacity.get_opacity_resultsTρ(sm.opacity, lnT, lnρ, xa, species)
+    per_call_trial = @benchmark Jems.Opacity.get_opacity_resultsTρ($sm.opacity, $lnT, $lnρ, $xa, $species)
+    per_call_seconds = minimum(per_call_trial).time * 1e-9
+    per_call_alloc = minimum(per_call_trial).memory
 
-    model_total_seconds = @belapsed begin
+    model_total_trial = @benchmark begin
         for k in 1:$sm.props.nz
             lT = Jems.DualSupport.get_cell_dual($sm.props.lnT[k])
             lρ = Jems.DualSupport.get_cell_dual($sm.props.lnρ[k])
@@ -49,17 +50,12 @@ function benchmark_opacity_eval(sm::StellarModel; zone::Int=1)
             Jems.Opacity.get_opacity_resultsTρ($sm.opacity, lT, lρ, xk, $species)
         end
     end
-    model_total_alloc = @allocated begin
-        for k in 1:sm.props.nz
-            lT = Jems.DualSupport.get_cell_dual(sm.props.lnT[k])
-            lρ = Jems.DualSupport.get_cell_dual(sm.props.lnρ[k])
-            xk = @view sm.props.xa_dual[k, :]
-            Jems.Opacity.get_opacity_resultsTρ(sm.opacity, lT, lρ, xk, species)
-        end
-    end
+    model_total_seconds = minimum(model_total_trial).time * 1e-9
+    model_total_alloc = minimum(model_total_trial).memory
 
-    properties_total_seconds = @belapsed StellarModels.evaluate_stellar_model_properties!($sm, $sm.props)
-    properties_total_alloc = @allocated StellarModels.evaluate_stellar_model_properties!(sm, sm.props)
+    properties_total_trial = @benchmark StellarModels.evaluate_stellar_model_properties!($sm, $sm.props)
+    properties_total_seconds = minimum(properties_total_trial).time * 1e-9
+    properties_total_alloc = minimum(properties_total_trial).memory
 
     println("=== Opacity evaluation benchmark ===")
     println("per-call opacity: $(round(per_call_seconds * 1e6, digits=3)) μs, alloc=$(per_call_alloc) bytes")

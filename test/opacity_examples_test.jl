@@ -72,6 +72,7 @@ end
         κ_mid = Jems.Opacity.get_opacity_resultsTρ(composite, log(10.0^4.0), log(1e-3), xa, species)
         κ_high = Jems.Opacity.get_opacity_resultsTρ(composite, log(10.0^4.2), log(1e-3), xa, species)
 
+        # Synthetic tables use constant logκ values 0.0 (low) and 1.0 (high), so κ should be 10^logκ.
         @test κ_low ≈ 1.0 atol = 1e-10
         @test κ_high ≈ 10.0 atol = 1e-10
         @test κ_low < κ_mid < κ_high
