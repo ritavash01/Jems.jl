@@ -19,6 +19,57 @@ include("initial_condition.jl")
 include("opacity.jl")
 include("eos.jl")
 
+function benchmark_opacity_table_loading(low_dir::String, low_key::String, high_dir::String, high_key::String)
+    low_stats = @timed Opacity_table_collector(low_dir, low_key)
+    high_stats = @timed Opacity_table_collector(high_dir, high_key)
+
+    println("=== Opacity table loading benchmark ===")
+    println("low-T tables:  time=$(round(low_stats.time, digits=3))s, alloc=$(low_stats.bytes) bytes")
+    println("high-T tables: time=$(round(high_stats.time, digits=3))s, alloc=$(high_stats.bytes) bytes")
+    println("=======================================")
+
+    return low_stats.value, high_stats.value
+end
+
+function benchmark_opacity_eval(sm::StellarModel; zone::Int=1)
+    i = clamp(zone, 1, sm.props.nz)
+    lnT = Jems.DualSupport.get_cell_dual(sm.props.lnT[i])
+    lnρ = Jems.DualSupport.get_cell_dual(sm.props.lnρ[i])
+    xa = @view sm.props.xa_dual[i, :]
+    species = sm.network.species_names
+
+    per_call_seconds = @belapsed Jems.Opacity.get_opacity_resultsTρ($sm.opacity, $lnT, $lnρ, $xa, $species)
+    per_call_alloc = @allocated Jems.Opacity.get_opacity_resultsTρ(sm.opacity, lnT, lnρ, xa, species)
+
+    model_total_seconds = @belapsed begin
+        for k in 1:$sm.props.nz
+            lT = Jems.DualSupport.get_cell_dual($sm.props.lnT[k])
+            lρ = Jems.DualSupport.get_cell_dual($sm.props.lnρ[k])
+            xk = @view $sm.props.xa_dual[k, :]
+            Jems.Opacity.get_opacity_resultsTρ($sm.opacity, lT, lρ, xk, $species)
+        end
+    end
+    model_total_alloc = @allocated begin
+        for k in 1:sm.props.nz
+            lT = Jems.DualSupport.get_cell_dual(sm.props.lnT[k])
+            lρ = Jems.DualSupport.get_cell_dual(sm.props.lnρ[k])
+            xk = @view sm.props.xa_dual[k, :]
+            Jems.Opacity.get_opacity_resultsTρ(sm.opacity, lT, lρ, xk, species)
+        end
+    end
+
+    properties_total_seconds = @belapsed StellarModels.evaluate_stellar_model_properties!($sm, $sm.props)
+    properties_total_alloc = @allocated StellarModels.evaluate_stellar_model_properties!(sm, sm.props)
+
+    println("=== Opacity evaluation benchmark ===")
+    println("per-call opacity: $(round(per_call_seconds * 1e6, digits=3)) μs, alloc=$(per_call_alloc) bytes")
+    println("model-wide opacity-only loop: $(round(model_total_seconds * 1e3, digits=3)) ms, alloc=$(model_total_alloc) bytes")
+    println("evaluate_stellar_model_properties!: $(round(properties_total_seconds * 1e3, digits=3)) ms, alloc=$(properties_total_alloc) bytes")
+    println("===================================")
+
+    return (; per_call_seconds, per_call_alloc, model_total_seconds, model_total_alloc, properties_total_seconds, properties_total_alloc)
+end
+
 ##
 #=
 ### Model creation
@@ -40,8 +91,12 @@ nextra = 100
 eos = EOS.IdealEOS(true)
 eos = EOS_table_collector("/Users/rdbnath/Documents/mesa-25.12.1/eos/eosFreeEOS_data")
 # opacity = Opacity.SimpleElectronScatteringOpacity()
-low_T_collection = Opacity_table_collector("/Users/rdbnath/Documents/share_oplib_type1_tables/kap_low_alt/", "lowT_fa05_gs98") 
-high_T_collection = Opacity_table_collector("/Users/rdbnath/Documents/share_oplib_type1_tables/kap_data/","oplib_agss09" ) 
+low_T_collection, high_T_collection = benchmark_opacity_table_loading(
+    "/Users/rdbnath/Documents/share_oplib_type1_tables/kap_low_alt/",
+    "lowT_fa05_gs98",
+    "/Users/rdbnath/Documents/share_oplib_type1_tables/kap_data/",
+    "oplib_agss09",
+)
 opacity = CompositeOpacity(low_T_collection, high_T_collection, 3.8, 4.2)
 turbulence = Turbulence.BasicMLT(2.0)
 ##
@@ -63,6 +118,7 @@ n = 1.5
 # Jems.StellarModels.n_polytrope_initial_condition!(n, sm, nz, 0.7154, 0.0142, 0.0, Chem.abundance_lists[:ASG_09], 5*MSUN,
 #                                              100 * RSUN; initial_dt=10 * SECYEAR)                                       
 Evolution.compute_starting_model_properties!(sm)
+opacity_baseline = benchmark_opacity_eval(sm)
 
 ##
 #=

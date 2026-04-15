@@ -1,478 +1,442 @@
-using Jems 
+using Jems
 using ForwardDiff
-using DelimitedFiles
 
-# export RT_table_opacity
-
-"""
-Structure to store data from a single OPLIB data file and store it as a 1D array of R,T alon with some metadata 
-"""
-struct RT_table_opacity <: Jems.Opacity.AbstractOpacity 
-    X :: Float64 
-    Z :: Float64 
-    logTs :: Vector{Float64}
-    logRs :: Vector{Float64}
-    kap_data :: Vector{Float64} 
-end 
+const INV_LN10 = 0.4342944819032518
+const _OPACITY_OFFSETS = (-1, 0, 1, 2)
+const _SPECIES_INDEX_CACHE_LOCK = ReentrantLock()
+const _SPECIES_INDEX_CACHE = Dict{UInt64,NTuple{2,Int}}()
 
 """
-Structure to store a matrix with X,Z being the rows and columns, and each element being a RT opacity table 
+Structure to store data from a single OPLIB data file and store it as a 1D array of R,T alon with some metadata
+"""
+struct RT_table_opacity <: Jems.Opacity.AbstractOpacity
+    X::Float64
+    Z::Float64
+    logTs::Vector{Float64}
+    logRs::Vector{Float64}
+    kap_data::Vector{Float64}
+    inv_dlogT::Vector{Float64}
+    inv_dlogR::Vector{Float64}
+end
+
+"""
+Structure to store a matrix with X,Z being the rows and columns, and each element being a RT opacity table
 """
 struct Opacity_table_collector <: Jems.Opacity.AbstractOpacity
-    Xs :: Vector{Float64}
-    Zs :: Vector{Float64}
-    tables :: Matrix{RT_table_opacity} #Grid containing each opacity table at X,Z
-end 
+    Xs::Vector{Float64}
+    Zs::Vector{Float64}
+    tables::Matrix{RT_table_opacity}
+    inv_dX::Vector{Float64}
+    inv_dZ::Vector{Float64}
+end
 
 """
-Structure to store opacaity tables of X,Z,R,T from different data set, also the meta data required to smooth interopolate between them 
-using a cubic spline 
+Structure to store opacaity tables of X,Z,R,T from different data set, also the meta data required to smooth interopolate between them
+using a cubic spline
 """
-struct CompositeOpacity <: Jems.Opacity.AbstractOpacity 
-    low_T_collector :: Opacity_table_collector # Holds the matrix of X,Z with each element being RT_table (for low T)
-    high_T_collector :: Opacity_table_collector #Holds the matrix of X,Z with each element being RT_table (for high T)
+struct CompositeOpacity <: Jems.Opacity.AbstractOpacity
+    low_T_collector::Opacity_table_collector # Holds the matrix of X,Z with each element being RT_table (for low T)
+    high_T_collector::Opacity_table_collector #Holds the matrix of X,Z with each element being RT_table (for high T)
 
-    # Holds the transition points 
-    trans_logT_min :: Float64
-    trans_logT_max :: Float64 
+    # Holds the transition points
+    trans_logT_min::Float64
+    trans_logT_max::Float64
+end
 
-end 
-    
-function RT_table_opacity(filepath :: String)
-    
-    #Reading the whole file into a string array 
-    lines = readlines(filepath) 
+mutable struct _OpacityLookupCache
+    ix::Int
+    iz::Int
+    iT::Int
+    iR::Int
+end
 
-    meta_idx = findfirst(l -> occursin(r"^\s*1\s+\d+", l), lines) # Looks for 1. for the start of metadata
-    if meta_idx === nothing 
-        error("Could not find Metadata line (starting with ' 1 '). File format unknown.")
+_OpacityLookupCache() = _OpacityLookupCache(1, 1, 1, 1)
+
+struct _OpacityEvalState{T<:Real}
+    logT::T
+    logR::T
+    val_logT::Float64
+    val_logR::Float64
+    X::T
+    Z::T
+    val_X::Float64
+    val_Z::Float64
+end
+
+@inline function _inverse_spacings(grid::Vector{Float64}, grid_name::String)
+    n = length(grid)
+    n >= 2 || error("$grid_name grid must contain at least 2 points, got $n")
+    inv_d = Vector{Float64}(undef, n - 1)
+    @inbounds for i in 1:(n - 1)
+        δ = grid[i + 1] - grid[i]
+        δ > 0 || error("$grid_name grid must be strictly increasing at index $i")
+        inv_d[i] = inv(δ)
     end
+    return inv_d
+end
 
-    parts = split(lines[meta_idx]) # Split the string into structured data and removing the spaces
+function RT_table_opacity(X::Float64, Z::Float64, logTs::Vector{Float64}, logRs::Vector{Float64}, kap_data::Vector{Float64})
+    inv_dlogT = _inverse_spacings(logTs, "logT")
+    inv_dlogR = _inverse_spacings(logRs, "logR")
+    return RT_table_opacity(X, Z, logTs, logRs, kap_data, inv_dlogT, inv_dlogR)
+end
 
-    X_val = parse(Float64, parts[3])
-    Z_val = parse(Float64, parts[4])
-    num_Rs = parse(Int, parts[5])
-    num_Ts = parse(Int, parts[8])
+@inline function _parse_numeric_row!(storage::Vector{Float64}, line::AbstractString, expected_cols::Int)
+    parts = split(line)
+    length(parts) == expected_cols || return false
+    @inbounds for i in 1:expected_cols
+        parsed = tryparse(Float64, parts[i])
+        parsed === nothing && return false
+        storage[i] = parsed
+    end
+    return true
+end
 
-    grid_line_idx = 0 
+function RT_table_opacity(filepath::String)
+    meta_found = false
+    grid_found = false
+    data_started = false
+
+    X_val = 0.0
+    Z_val = 0.0
+    num_Rs = 0
+    num_Ts = 0
+
     logRs = Float64[]
+    logTs = Float64[]
+    data = Float64[]
 
-    for i in (meta_idx + 1):min(meta_idx + 20, length(lines))
-        row_vals = split(lines[i])
-        # Check if line is all numbers and has correct length
-        if length(row_vals) == num_Rs && all(x -> tryparse(Float64, x) !== nothing, row_vals)
-            grid_line_idx = i
-            logRs = parse.(Float64, row_vals)
-            break
-        end
-    end
+    grid_buffer = Float64[]
+    data_row_buffer = Float64[]
+    row_counter = 0
 
-    if grid_line_idx == 0
-        error("Could not find Grid Line! Searched 20 lines after metadata for a row with $num_Rs numbers.")
-    end
-    # println("Grid (logRs) found at Line $grid_line_idx.")
+    open(filepath, "r") do io
+        for (line_idx, line) in enumerate(eachline(io))
+            if !meta_found
+                if occursin(r"^\s*1\s+\d+", line)
+                    parts = split(line)
+                    length(parts) >= 8 || error("Invalid metadata line at $filepath:$line_idx")
 
-    data_start_idx = 0
-    
-    for i in (grid_line_idx + 1):min(grid_line_idx + 10, length(lines))
-        row_vals = split(lines[i])
-        if length(row_vals) == (num_Rs + 1) && all(x -> tryparse(Float64, x) !== nothing, row_vals)
-            data_start_idx = i
-            break
-        end
-    end
+                    X_val = parse(Float64, parts[3])
+                    Z_val = parse(Float64, parts[4])
+                    num_Rs = parse(Int, parts[5])
+                    num_Ts = parse(Int, parts[8])
 
-    if data_start_idx == 0
-        error("Could not find Data Start! Searched lines after grid for row with $(num_Rs + 1) numbers.")
-    end
-    # println("Data starts at Line $data_start_idx.")
+                    num_Rs > 1 || error("Invalid R-grid size in $filepath:$line_idx")
+                    num_Ts > 1 || error("Invalid T-grid size in $filepath:$line_idx")
 
-    ## pre-allocating memory 
+                    logRs = Vector{Float64}(undef, num_Rs)
+                    logTs = Vector{Float64}(undef, num_Ts)
+                    data = Vector{Float64}(undef, num_Rs * num_Ts)
 
-    logTs = Vector{Float64}(undef, num_Ts)
-    data = Vector{Float64}(undef, num_Rs * num_Ts)
+                    grid_buffer = Vector{Float64}(undef, num_Rs)
+                    data_row_buffer = Vector{Float64}(undef, num_Rs + 1)
+                    meta_found = true
+                end
+                continue
+            end
 
+            if !grid_found
+                if _parse_numeric_row!(grid_buffer, line, num_Rs)
+                    copyto!(logRs, grid_buffer)
+                    grid_found = true
+                end
+                continue
+            end
 
-    for T_idx in 1:num_Ts
-        current_line_idx = data_start_idx + T_idx - 1 
-        if current_line_idx > length(lines)
-            error("Unexpected End of File at line $line_idx")
-        end
-        # Format: "3.750  -0.6258  -0.7084 ..."
-        row_parts = split(lines[current_line_idx])
-        #Safety check
-        if length(row_parts) != (num_Rs + 1)
-            error("Format Error at line $current_line_idx: Expected $(num_Rs+1) columns, found $(length(row_parts))")
-        end
-        logTs[T_idx] = parse(Float64, row_parts[1]) #Storing the Temperature
+            if _parse_numeric_row!(data_row_buffer, line, num_Rs + 1)
+                data_started = true
+                row_counter += 1
+                row_counter <= num_Ts || error("Too many data rows in $filepath:$line_idx")
 
-        for R_idx in 1:num_Rs
-            val = parse(Float64, row_parts[R_idx + 1])
-            flat_idx = R_idx + (T_idx - 1) * num_Rs
-            data[flat_idx] = val 
-
-        end
-    end 
-    return RT_table_opacity(X_val, Z_val, logTs, logRs, data)
-end 
-
-function Opacity_table_collector(directory :: String, mixture_key :: String)
-    files = readdir(directory; join= true)
-    opacity_files = filter(f -> endswith(f, ".data"), files) # A safety check if the directory contains other things
-
-    if isempty(opacity_files)
-        error("No .data files found in $directory")
-    end
-
-    temp_tables = RT_table_opacity[]
-
-    for file in opacity_files
-        if occursin(mixture_key, basename(file))
-            try
-                push!(temp_tables, RT_table_opacity(file))
-            catch e 
-                println("Warning: Skipping file $file due to error: $e")
+                @inbounds begin
+                    logTs[row_counter] = data_row_buffer[1]
+                    base = (row_counter - 1) * num_Rs
+                    for j in 1:num_Rs
+                        data[base + j] = data_row_buffer[j + 1]
+                    end
+                end
+            elseif data_started && !isempty(strip(line))
+                error("Malformed data row in $filepath:$line_idx; expected $(num_Rs + 1) numeric columns")
             end
         end
     end
 
-    unique_Xs = sort(unique([t.X for t in temp_tables]))
-    unique_Zs = sort(unique([t.Z for t in temp_tables]))
+    meta_found || error("Could not find metadata line in $filepath")
+    grid_found || error("Could not find logR grid row with $num_Rs entries in $filepath")
+    row_counter == num_Ts || error("Unexpected data row count in $filepath: expected $num_Ts, found $row_counter")
 
-    grid = Matrix{RT_table_opacity}(undef, length(unique_Xs), length(unique_Zs))
+    return RT_table_opacity(X_val, Z_val, logTs, logRs, data)
+end
 
-    for t in temp_tables
-        x_idx = searchsortedfirst(unique_Xs, t.X)
-        z_idx = searchsortedfirst(unique_Zs, t.Z)
-        grid[x_idx, z_idx] = t 
-    end 
-    println("Opacity tables loaded")
-    return Opacity_table_collector(unique_Xs, unique_Zs, grid)
+function _build_validated_grid(temp_tables::Vector{RT_table_opacity})
+    isempty(temp_tables) && error("No opacity tables were loaded")
 
-end 
+    unique_Xs = sort(unique(t.X for t in temp_tables))
+    unique_Zs = sort(unique(t.Z for t in temp_tables))
 
-@inline function damp_slope(x::T) where T
-        if x > 1.0
-            # Start at edge (1.0) + tiny fraction of the excess
-            return 1.0 + 0.5 * (x - 1.0)
-        elseif x < 0.0
-            # Start at edge (0.0) + tiny fraction of the deficit
-            return 0.0 + 0.5 * x
-        else
-            return x
+    length(unique_Xs) >= 2 || error("Opacity X grid needs at least 2 points")
+    length(unique_Zs) >= 2 || error("Opacity Z grid needs at least 2 points")
+
+    x_to_idx = Dict{Float64,Int}(x => i for (i, x) in enumerate(unique_Xs))
+    z_to_idx = Dict{Float64,Int}(z => i for (i, z) in enumerate(unique_Zs))
+
+    maybe_grid = Matrix{Union{Nothing,RT_table_opacity}}(nothing, length(unique_Xs), length(unique_Zs))
+
+    for table in temp_tables
+        ix = x_to_idx[table.X]
+        iz = z_to_idx[table.Z]
+        isnothing(maybe_grid[ix, iz]) || error("Duplicate opacity table for X=$(table.X), Z=$(table.Z)")
+        maybe_grid[ix, iz] = table
+    end
+
+    missing_coords = Tuple{Float64,Float64}[]
+    for ix in eachindex(unique_Xs)
+        for iz in eachindex(unique_Zs)
+            if isnothing(maybe_grid[ix, iz])
+                push!(missing_coords, (unique_Xs[ix], unique_Zs[iz]))
+            end
         end
     end
 
+    isempty(missing_coords) || error("Incomplete opacity grid; missing tables for coordinates: $missing_coords")
 
-# function get_log_kappa_per_table(table::RT_table_opacity, val_logT::Float64, val_logR::Float64, logT::T, logR::T) where T
- 
-#     # The following part was for clamping the value of T,R at the edges so that value of κ outside the boundary is constant and stable, but this constant value 
-#     # causes issues with duals, so now the value is extrapolated smoothly outside the boundary using a very small slope
- 
-#     # # Clamping data 
-#     # min_T, max_T = table.logTs[1], table.logTs[end]
-#     # min_R, max_R = table.logRs[1], table.logRs[end]
+    grid = Matrix{RT_table_opacity}(undef, length(unique_Xs), length(unique_Zs))
+    for ix in eachindex(unique_Xs)
+        for iz in eachindex(unique_Zs)
+            grid[ix, iz] = maybe_grid[ix, iz]::RT_table_opacity
+        end
+    end
 
-#     # eff_logT = clamp(logT, min_T, max_T)
-#     # eff_logR = clamp(logR, min_R, max_R)
+    return unique_Xs, unique_Zs, grid
+end
 
-#     T_idx = searchsortedlast(table.logTs, val_logT)
-#     R_idx = searchsortedlast(table.logRs, val_logR)
+function Opacity_table_collector(directory::String, mixture_key::String)
+    files = readdir(directory; join = true)
+    opacity_files = filter(f -> endswith(f, ".data") && occursin(mixture_key, basename(f)), files)
 
-#     ## Boundary cases (For now clamping to the edge)
-#     T_idx = clamp(T_idx, 1, length(table.logTs)-1)
-#     R_idx = clamp(R_idx, 1, length(table.logRs)-1)
+    isempty(opacity_files) && error("No .data files with mixture key '$mixture_key' found in $directory")
 
-#     #logR and logT values
-#     R0 = table.logRs[R_idx]
-#     R1 = table.logRs[R_idx+1]
-#     T0 = table.logTs[T_idx]
-#     T1 = table.logTs[T_idx+1]
+    temp_tables = RT_table_opacity[]
+    for file in opacity_files
+        push!(temp_tables, RT_table_opacity(file))
+    end
 
-#     # Calculating the slopes 
-#     u = (logR - R0)/ (R1 - R0)
-#     v = (logT - T0)/ (T1 - T0)
+    unique_Xs, unique_Zs, grid = _build_validated_grid(temp_tables)
+    inv_dX = _inverse_spacings(unique_Xs, "X")
+    inv_dZ = _inverse_spacings(unique_Zs, "Z")
 
-    
+    println("Opacity tables loaded")
+    return Opacity_table_collector(unique_Xs, unique_Zs, grid, inv_dX, inv_dZ)
+end
 
-#     u_damped = damp_slope(u)
-#     v_damped = damp_slope(v)
-    
-    
-#     # Now we will look into the 1D array since we have the indexes
-
-#     N_R = length(table.logRs)
-
-#     # calculating the kappa values 
-#     #Bottom left value for interpolation
-#     idx_00 = R_idx + (T_idx - 1) * N_R
-#     val_00 = table.kap_data[idx_00]
-    
-#     #Bottom right value for interpolation
-#     idx_10 = (R_idx + 1)+ (T_idx - 1) * N_R
-#     val_10 = table.kap_data[idx_10]
-
-#     #Top left value for interpolation
-#     idx_01 = R_idx + T_idx * N_R
-#     val_01 = table.kap_data[idx_01]
-
-#     #Top right value for interpolation
-#     idx_11 = (R_idx + 1) + T_idx * N_R
-#     val_11 = table.kap_data[idx_11]
-
-
-#     #Bilinear Interpolation
-#     # f(x,y) = (1-u)(1-v)f00 + u(1-v)f10 + (1-u)v f01 + uv f11
-#     w00 = (1 - u_damped) * (1 - v_damped)
-#     w10 = u_damped * (1 - v_damped)
-#     w01 = (1 - u_damped) * v_damped
-#     w11 = u_damped * v_damped
-
-#     interpolated_log_kappa = (w00 * val_00) + (w10 * val_10) + 
-#                              (w01 * val_01) + (w11 * val_11)
-
-#     return interpolated_log_kappa
-
-# end
-
-
-
+@inline function damp_slope(x::T) where T
+    if x > 1.0
+        # Start at edge (1.0) + tiny fraction of the excess
+        return 1.0 + 0.5 * (x - 1.0)
+    elseif x < 0.0
+        # Start at edge (0.0) + tiny fraction of the deficit
+        return 0.0 + 0.5 * x
+    else
+        return x
+    end
+end
 
 # The following function implements Bicubic interpolation using Catmull-Rom Cubic Basis Functions (for unit square)
-
-@inline function cubic_weights(t :: T) where T
+@inline function cubic_weights(t::T) where T
     t2 = t * t
-    t3 = t2 * t 
+    t3 = t2 * t
 
     # Standard Catmull-Rom weights: [1 t t^2 t^3] M_SH (M_SH is the  Catmull-Rom Cubic Basis matrix for 1D)
     # https://en.wikipedia.org/wiki/Catmull–Rom_spline
     w_m1 = -0.5 * t3 + 1.0 * t2 - 0.5 * t
-    w_0  =  1.5 * t3 - 2.5 * t2 + 1.0
-    w_1  = -1.5 * t3 + 2.0 * t2 + 0.5 * t
-    w_2  =  0.5 * t3 - 0.5 * t2
-    
-    return w_m1, w_0, w_1, w_2
+    w_0 = 1.5 * t3 - 2.5 * t2 + 1.0
+    w_1 = -1.5 * t3 + 2.0 * t2 + 0.5 * t
+    w_2 = 0.5 * t3 - 0.5 * t2
+
+    return (w_m1, w_0, w_1, w_2)
 end
 
-function get_log_kappa_per_table(table::RT_table_opacity, val_logT::Float64, val_logR::Float64, logT::T, logR::T) where T
-    # Get table boundaries
+@inline function _walk_cell_index(grid::Vector{Float64}, value::Float64, previous_idx::Int)
+    n = length(grid)
+    n >= 2 || return 1
+
+    i = clamp(previous_idx, 1, n - 1)
+    @inbounds begin
+        if value < grid[i]
+            while i > 1 && value < grid[i]
+                i -= 1
+            end
+        elseif value >= grid[i + 1]
+            while i < (n - 1) && value >= grid[i + 1]
+                i += 1
+            end
+        end
+    end
+    return i
+end
+
+@inline function _resolve_species_indices(species::Vector{Symbol})
+    key = objectid(species)
+    lock(_SPECIES_INDEX_CACHE_LOCK)
+    try
+        if haskey(_SPECIES_INDEX_CACHE, key)
+            return _SPECIES_INDEX_CACHE[key]
+        end
+
+        iH1 = findfirst(==(:H1), species)
+        iHe4 = findfirst(==(:He4), species)
+        iH1 === nothing && error("Opacity requires species :H1")
+        iHe4 === nothing && error("Opacity requires species :He4")
+
+        idx = (iH1::Int, iHe4::Int)
+        _SPECIES_INDEX_CACHE[key] = idx
+        return idx
+    finally
+        unlock(_SPECIES_INDEX_CACHE_LOCK)
+    end
+end
+
+@inline function _build_eval_state(lnT::TT, lnρ::TT, xa::AbstractVector{<:TT}, species::Vector{Symbol}) where {TT<:Real}
+    logT = lnT * INV_LN10
+    logρ = lnρ * INV_LN10
+    logR = logρ - 3 * logT + 18
+
+    iH1, iHe4 = _resolve_species_indices(species)
+    X = xa[iH1]
+    Y = xa[iHe4]
+    Z = one(TT) - X - Y
+
+    return _OpacityEvalState(logT, logR, ForwardDiff.value(logT), ForwardDiff.value(logR), X, Z,
+                             ForwardDiff.value(X), ForwardDiff.value(Z))
+end
+
+@inline function _get_log_kappa_per_table(table::RT_table_opacity, eval_state::_OpacityEvalState{T}, cache::_OpacityLookupCache) where {T<:Real}
     min_T, max_T = table.logTs[1], table.logTs[end]
     min_R, max_R = table.logRs[1], table.logRs[end]
 
-    # Clamp the Dual Numbers (Preserves derivatives inside, zeros them outside)
-    eff_logT = clamp(logT, min_T, max_T)
-    eff_logR = clamp(logR, min_R, max_R)
+    eff_logT = clamp(eval_state.logT, min_T, max_T)
+    eff_logR = clamp(eval_state.logR, min_R, max_R)
+    eff_val_logT = clamp(eval_state.val_logT, min_T, max_T)
+    eff_val_logR = clamp(eval_state.val_logR, min_R, max_R)
 
-    # Also clamp the Float values for index searching
-    eff_val_logT = clamp(val_logT, min_T, max_T)
-    eff_val_logR = clamp(val_logR, min_R, max_R)
+    i_T = _walk_cell_index(table.logTs, eff_val_logT, cache.iT)
+    i_R = _walk_cell_index(table.logRs, eff_val_logR, cache.iR)
+    cache.iT = i_T
+    cache.iR = i_R
 
-    i_T = searchsortedlast(table.logTs, eff_val_logT)
-    i_R = searchsortedlast(table.logRs, eff_val_logR)
-    
-    #length of the tables
-    N_T = length(table.logTs)
-    N_R = length(table.logRs)
+    @inbounds begin
+        u = (eff_logT - table.logTs[i_T]) * table.inv_dlogT[i_T]
+        v = (eff_logR - table.logRs[i_R]) * table.inv_dlogR[i_R]
 
-    #clamping the indexes ()
-    i_T = clamp(i_T, 1, N_T - 1)
-    i_R = clamp(i_R, 1, N_R - 1)
+        wt = cubic_weights(u)
+        wr = cubic_weights(v)
 
-    T_min, T_max = table.logTs[i_T], table.logTs[i_T+1]
-    R_min, R_max = table.logRs[i_R], table.logRs[i_R+1]
+        nR = length(table.logRs)
+        nT = length(table.logTs)
+        log_kappa = zero(T)
 
-    u = (eff_logT - T_min) / (T_max - T_min)
-    v = (eff_logR - R_min) / (R_max - R_min)
-
-    wt_m1, wt_0, wt_1, wt_2 = cubic_weights(u)
-    wr_m1, wr_0, wr_1, wr_2 = cubic_weights(v)
-
-    weights_T = (wt_m1, wt_0, wt_1, wt_2)
-    weights_R = (wr_m1, wr_0, wr_1, wr_2)
-
-    log_kappa = zero(T)
-
-    for (idx_T, offset_T) in enumerate(-1:2)
-        for (idx_R, offset_R) in enumerate(-1:2)
-            curr_T_idx = i_T + offset_T
-            curr_R_idx = i_R + offset_R
-
-            real_idx_T = clamp(curr_T_idx, 1, N_T)
-            real_idx_R = clamp(curr_R_idx, 1, N_R)
-
-            flat_idx = real_idx_R + (real_idx_T - 1) * N_R
-            
-            val = table.kap_data[flat_idx]
-
-            # --- ACCUMULATION ---
-            # Add: Value * Weight_T * Weight_R
-            log_kappa += val * weights_T[idx_T] * weights_R[idx_R]
-        end
-    end 
-    return log_kappa
-end 
-
-
-
-function get_opacity_table_collection(collection :: Opacity_table_collector, lnT::TT, lnρ::TT, xa::AbstractVector{<:TT}, species::Vector{Symbol})::TT where {TT<:Real}
-    
-    inv_ln10 = 0.4342944819032518
-    logT = lnT * inv_ln10
-    logρ = lnρ * inv_ln10
-    logR = logρ - 3*logT + 18
-    
-    val_logT = ForwardDiff.value(logT)
-    val_logR = ForwardDiff.value(logR)
-
-    # X_dual = zero(TT)
-    # Y_dual = zero(TT)
-
-    # for i in eachindex(species)
-    #     name = species[i]
-    #     # Sum Hydrogens (H1, H2) for X
-    #     if name == :H1 
-    #         X_dual += xa[i]
-    #     # Sum Heliums (He3, He4) for Y
-    #     elseif name == :He4
-    #         Y_dual += xa[i]
-    #     end
-    # end
-    iH1 = findfirst(==(:H1), species)
-    X_dual = xa[iH1]
-    iHe4 = findfirst(==(:He4), species)
-    Y_dual = xa[iHe4]
-    Z_dual = 1 - X_dual -Y_dual
-
-    val_X = ForwardDiff.value(X_dual)
-    val_Z = ForwardDiff.value(Z_dual)
-    # println("Target Composition: X = $(round(val_X, digits=5)), Z = $(round(val_Z, digits=5))")
-    Nx = length(collection.Xs)
-    Nz = length(collection.Zs)
-
-    ix = clamp(searchsortedlast(collection.Xs, val_X), 1, Nx-1)
-    iz = clamp(searchsortedlast(collection.Zs, val_Z), 1, Nz - 1)
-
-    # X0 = collection.Xs[ix]
-    # X1 = collection.Xs[ix+1]
-    # Z0 = collection.Zs[iz]
-    # Z1 = collection.Zs[iz+1]
-    
-    # # wx = (X_dual - X0) / (X1 - X0)
-    # # wz = (Z_dual - Z0) / (Z1 - Z0)
-
-    # # wx = clamp(wx, 0.0, 1.0)
-    # # wz = clamp(wz, 0.0, 1.0)
-
-    # #Now using dampslope instead of clamping 
-    # wx = damp_slope((X_dual - X0) / (X1 - X0))
-    # wz = damp_slope((Z_dual - Z0) / (Z1 - Z0))
-
-
-    # t00 = collection.tables[ix,   iz]   # Low X, Low Z
-    # t10 = collection.tables[ix+1, iz]   # High X, Low Z
-    # t01 = collection.tables[ix,   iz+1] # Low X, High Z
-    # t11 = collection.tables[ix+1, iz+1] # High X, High Z
-
-    # k00 = get_log_kappa_per_table(t00, val_logT, val_logR, logT, logR)
-    # k10 = get_log_kappa_per_table(t10, val_logT, val_logR, logT, logR)
-    # k01 = get_log_kappa_per_table(t01, val_logT, val_logR, logT, logR)
-    # k11 = get_log_kappa_per_table(t11, val_logT, val_logR, logT, logR)
-
-    # # Interpolate X first (at fixed Zs)
-    # k_z0 = k00 * (1 - wx) + k10 * wx
-    # k_z1 = k01 * (1 - wx) + k11 * wx
-
-    # # Interpolate Z
-    # log_kappa_final = k_z0 * (1 - wz) + k_z1 * wz
-
-    """
-    Bicubic interpolation
-    """
-    u_X = (X_dual - collection.Xs[ix]) / (collection.Xs[ix+1] - collection.Xs[ix])
-    u_Z = (Z_dual - collection.Zs[iz]) / (collection.Zs[iz+1] - collection.Zs[iz])
-
-    wX = cubic_weights(u_X)
-    wZ = cubic_weights(u_Z)
-    # @show wX, wZ, collection.Xs[ix], collection.Zs[iz]
-    log_kappa_final = zero(TT)
-    for (itx, offset_x) in enumerate(-1:2)
-        for (itz, offset_z) in enumerate(-1:2)
-            
-            # Boundary handling for the table grid indices
-            real_ix = clamp(ix + offset_x, 1, Nx)
-            real_iz = clamp(iz + offset_z, 1, Nz)
-
-            # Check if table exists (handles the X=1.0, Z>0 empty spots you mentioned)
-            if !isassigned(collection.tables, real_ix, real_iz)
-                #  if a corner of the stencil is missing, use the central table
-                # In a real OPLIB grid, you'd want a more robust neighbor search here
-                table = collection.tables[ix, iz]
-            else
-                table = collection.tables[real_ix, real_iz]
+        for it in 1:4
+            real_iT = clamp(i_T + _OPACITY_OFFSETS[it], 1, nT)
+            base = (real_iT - 1) * nR
+            wt_i = wt[it]
+            for ir in 1:4
+                real_iR = clamp(i_R + _OPACITY_OFFSETS[ir], 1, nR)
+                log_kappa += table.kap_data[base + real_iR] * wt_i * wr[ir]
             end
-
-            # Get log_kappa for this specific table at (T, R) using Bicubic
-            k_val = get_log_kappa_per_table(table, val_logT, val_logR, logT, logR)
-
-            # Accumulate using composition weights
-            log_kappa_final += k_val * wX[itx] * wZ[itz]
         end
-    end
-    # # Final Safety Cap
-    # limit = 50.0
-    # val_final = ForwardDiff.value(log_kappa_final)
-    # if val_final > limit
-    #      # Limit + tiny slope
-    #      log_kappa_final = limit + 1e-6 * (log_kappa_final - limit)
-    # elseif val_final < -limit
-    #      log_kappa_final = -limit + 1e-6 * (log_kappa_final + limit)
-    # end
 
-    return 10^log_kappa_final
+        return log_kappa
+    end
 end
 
-# Smoothing function to interpolate smoothly between the two datasets 
+function get_log_kappa_per_table(table::RT_table_opacity, val_logT::Float64, val_logR::Float64, logT::T, logR::T) where {T<:Real}
+    eval_state = _OpacityEvalState(logT, logR, val_logT, val_logR, zero(T), zero(T), 0.0, 0.0)
+    return _get_log_kappa_per_table(table, eval_state, _OpacityLookupCache())
+end
+
+@inline function _get_log_kappa_collection(collection::Opacity_table_collector, eval_state::_OpacityEvalState{TT}, cache::_OpacityLookupCache) where {TT<:Real}
+    min_X, max_X = collection.Xs[1], collection.Xs[end]
+    min_Z, max_Z = collection.Zs[1], collection.Zs[end]
+
+    eff_X = clamp(eval_state.X, min_X, max_X)
+    eff_Z = clamp(eval_state.Z, min_Z, max_Z)
+    eff_val_X = clamp(eval_state.val_X, min_X, max_X)
+    eff_val_Z = clamp(eval_state.val_Z, min_Z, max_Z)
+
+    ix = _walk_cell_index(collection.Xs, eff_val_X, cache.ix)
+    iz = _walk_cell_index(collection.Zs, eff_val_Z, cache.iz)
+    cache.ix = ix
+    cache.iz = iz
+
+    @inbounds begin
+        u_X = (eff_X - collection.Xs[ix]) * collection.inv_dX[ix]
+        u_Z = (eff_Z - collection.Zs[iz]) * collection.inv_dZ[iz]
+
+        wX = cubic_weights(u_X)
+        wZ = cubic_weights(u_Z)
+
+        Nx = length(collection.Xs)
+        Nz = length(collection.Zs)
+        log_kappa_final = zero(TT)
+
+        for itx in 1:4
+            real_ix = clamp(ix + _OPACITY_OFFSETS[itx], 1, Nx)
+            wx = wX[itx]
+            for itz in 1:4
+                real_iz = clamp(iz + _OPACITY_OFFSETS[itz], 1, Nz)
+                table = collection.tables[real_ix, real_iz]
+                table_log_kappa = _get_log_kappa_per_table(table, eval_state, cache)
+                log_kappa_final += table_log_kappa * wx * wZ[itz]
+            end
+        end
+
+        return log_kappa_final
+    end
+end
+
+function get_opacity_table_collection(collection::Opacity_table_collector, lnT::TT, lnρ::TT,
+                                      xa::AbstractVector{<:TT}, species::Vector{Symbol})::TT where {TT<:Real}
+    eval_state = _build_eval_state(lnT, lnρ, xa, species)
+    log_kappa = _get_log_kappa_collection(collection, eval_state, _OpacityLookupCache())
+    return 10^log_kappa
+end
+
+# Smoothing function to interpolate smoothly between the two datasets
 # Using the function f(t)=3t^2 - 2t^3
 @inline function smooth_step_func(x::T, floor::Float64, ceil::Float64) where T
-    if x <= floor 
+    if x <= floor
         return zero(T)
     elseif x >= ceil
         return one(T)
     else
-        t = (x - floor)/(ceil - floor)
+        t = (x - floor) / (ceil - floor)
 
-        return t * t * (3.0 -2.0 * t)
-    end 
-
+        return t * t * (3.0 - 2.0 * t)
+    end
 end
 
-function Jems.Opacity.get_opacity_resultsTρ(composite :: CompositeOpacity, lnT::TT, lnρ::TT, xa::AbstractVector{<:TT}, species::Vector{Symbol})::TT where {TT <: Real}
-    inv_ln10 = 0.4342944819032518
-    logT = lnT * inv_ln10
-    val_logT = ForwardDiff.value(logT)
+function Jems.Opacity.get_opacity_resultsTρ(composite::CompositeOpacity, lnT::TT, lnρ::TT,
+                                            xa::AbstractVector{<:TT}, species::Vector{Symbol})::TT where {TT<:Real}
+    eval_state = _build_eval_state(lnT, lnρ, xa, species)
+    val_logT = eval_state.val_logT
 
-    # calculating the weight based on log
-
-
-    if val_logT >= composite.trans_logT_max 
-        return get_opacity_table_collection(composite.high_T_collector, lnT, lnρ, xa, species)
-
+    if val_logT >= composite.trans_logT_max
+        log_κ = _get_log_kappa_collection(composite.high_T_collector, eval_state, _OpacityLookupCache())
+        return 10^log_κ
     elseif val_logT <= composite.trans_logT_min
-        return get_opacity_table_collection(composite.low_T_collector, lnT, lnρ, xa, species)
+        log_κ = _get_log_kappa_collection(composite.low_T_collector, eval_state, _OpacityLookupCache())
+        return 10^log_κ
+    else
+        low_cache = _OpacityLookupCache()
+        high_cache = _OpacityLookupCache()
 
-    else 
-        κ_low  = get_opacity_table_collection(composite.low_T_collector, lnT, lnρ, xa, species)
-        κ_high = get_opacity_table_collection(composite.high_T_collector, lnT, lnρ, xa, species)
+        log_κ_low = _get_log_kappa_collection(composite.low_T_collector, eval_state, low_cache)
+        log_κ_high = _get_log_kappa_collection(composite.high_T_collector, eval_state, high_cache)
 
-        #calculating the weight 
-        w = smooth_step_func(logT, composite.trans_logT_min, composite.trans_logT_max)
-
-        log_κ_low = log10(κ_low)
-        log_κ_high = log10(κ_high)
-        smooth_log_κ = (1-w) * log_κ_low + w * log_κ_high
+        w = smooth_step_func(eval_state.logT, composite.trans_logT_min, composite.trans_logT_max)
+        smooth_log_κ = (one(TT) - w) * log_κ_low + w * log_κ_high
 
         return 10^smooth_log_κ
-
-    end 
+    end
 end
