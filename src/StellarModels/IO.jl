@@ -12,6 +12,7 @@ const width = 9
 const decimals = 4
 const floatstr = "%#$width.$decimals" * "g "
 const intstr = "%$width" * "i "
+# Hydro equations are ordered with continuity at slot 3 (see EquationSet/Evolution equation ordering).
 const CONTINUITY_EQUATION_INDEX = 3
 
 mutable struct TerminalHeader
