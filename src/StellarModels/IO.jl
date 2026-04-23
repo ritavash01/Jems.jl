@@ -280,7 +280,7 @@ function write_newton_iteration_data(sm::StellarModel, newton_iter::Int)
 
     data_cols = sm.opt.io.profile_values
     ncols = length(data_cols)
-    dataset_name = "newton_$(lpad(target_model_number, sm.opt.io.hdf5_profile_dataset_name_zero_padding, "0"))_$(lpad(newton_iter, 4, "0"))"
+    dataset_name = "newton_$(lpad(target_model_number, sm.opt.io.hdf5_profile_dataset_name_zero_padding, "0"))_$(lpad(newton_iter, sm.opt.io.hdf5_profile_newton_iter_zero_padding, "0"))"
 
     if haskey(sm.profiles_file, dataset_name)
         if !sm.opt.io.hdf5_profile_keep_open
