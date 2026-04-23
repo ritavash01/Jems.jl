@@ -259,6 +259,56 @@ function shut_down_IO!(m)
     end
 end
 
+function write_newton_iteration_data(sm::StellarModel, newton_iter::Int)
+    if sm.opt.io.profile_interval <= 0
+        return
+    end
+
+    target_model_number = sm.props.model_number + 1
+    if target_model_number % sm.opt.io.profile_interval != 0
+        return
+    end
+
+    file_exists = isfile(sm.opt.io.hdf5_profile_filename)
+    if !file_exists
+        throw(ErrorException("Profile file does not exist at $(sm.opt.io.hdf5_profile_filename)"))
+    end
+
+    if !sm.opt.io.hdf5_profile_keep_open
+        sm.profiles_file = h5open(sm.opt.io.hdf5_profile_filename, "r+")
+    end
+
+    data_cols = sm.opt.io.profile_values
+    ncols = length(data_cols)
+    dataset_name = "newton_$(lpad(target_model_number, sm.opt.io.hdf5_profile_dataset_name_zero_padding, "0"))_$(lpad(newton_iter, 4, "0"))"
+
+    if haskey(sm.profiles_file, dataset_name)
+        if !sm.opt.io.hdf5_profile_keep_open
+            close(sm.profiles_file)
+        end
+        return
+    end
+
+    profile = create_dataset(sm.profiles_file,
+                             dataset_name,
+                             Float64, ((sm.props.nz, ncols), (sm.props.nz, ncols));
+                             chunk=(sm.opt.io.hdf5_profile_chunk_size, ncols),
+                             compress=sm.opt.io.hdf5_profile_compression_level)
+
+    attrs(profile)["column_units"] = [sm.profile_output_units[data_cols[i]] for i in eachindex(data_cols)]
+    attrs(profile)["column_names"] = [data_cols[i] for i in eachindex(data_cols)]
+    attrs(profile)["model_number"] = target_model_number
+    attrs(profile)["newton_iter"] = newton_iter
+
+    for i in eachindex(data_cols), k = 1:(sm.props.nz)
+        profile[k, i] = sm.profile_output_functions[data_cols[i]](sm, k)
+    end
+
+    if !sm.opt.io.hdf5_profile_keep_open
+        close(sm.profiles_file)
+    end
+end
+
 """
     write_data(sm::StellarModel)
 
