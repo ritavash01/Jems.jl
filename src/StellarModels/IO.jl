@@ -12,6 +12,7 @@ const width = 9
 const decimals = 4
 const floatstr = "%#$width.$decimals" * "g "
 const intstr = "%$width" * "i "
+const CONTINUITY_EQUATION_INDEX = 3
 
 mutable struct TerminalHeader
     header::String
@@ -170,7 +171,7 @@ function setup_model_profile_functions!(sm::StellarModel)
     add_profile_option!(sm, "D_face", "cm^2*s^{-1}", (sm, k) -> get_value(sm.props.turb_res[k].D_turb), label=L"D_\text{face}\,[\text{cm^2\,s^{-1}}]")
 
     # solver diagnostics
-    add_profile_option!(sm, "residual_continuity", "unitless", (sm, k) -> sm.solver_data.eqs_numbers[(k - 1) * sm.nvars + 3], label=L"\mathcal{R}_\text{continuity}")
+    add_profile_option!(sm, "residual_continuity", "unitless", (sm, k) -> sm.solver_data.eqs_numbers[(k - 1) * sm.nvars + CONTINUITY_EQUATION_INDEX], label=L"\mathcal{R}_\text{continuity}")
     add_profile_option!(sm, "correction_lnrho", "unitless", (sm, k) -> sm.solver_data.solver_corr[(k - 1) * sm.nvars + sm.vari[:lnρ]], label=L"\Delta\ln\rho")
     add_profile_option!(sm, "correction_lnr", "unitless", (sm, k) -> sm.solver_data.solver_corr[(k - 1) * sm.nvars + sm.vari[:lnr]], label=L"\Delta\ln r")
 end
@@ -264,6 +265,8 @@ function write_newton_iteration_data(sm::StellarModel, newton_iter::Int)
         return
     end
 
+    # We are solving for the next accepted model, so this is the model number that
+    # will be assigned if the current Newton solve converges.
     next_model_number = sm.props.model_number + 1
     if next_model_number % sm.opt.io.profile_interval != 0
         return
