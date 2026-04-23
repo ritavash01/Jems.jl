@@ -264,8 +264,8 @@ function write_newton_iteration_data(sm::StellarModel, newton_iter::Int)
         return
     end
 
-    model_number_for_write = sm.props.model_number + 1
-    if model_number_for_write % sm.opt.io.profile_interval != 0
+    next_model_number = sm.props.model_number + 1
+    if next_model_number % sm.opt.io.profile_interval != 0
         return
     end
 
@@ -280,7 +280,7 @@ function write_newton_iteration_data(sm::StellarModel, newton_iter::Int)
 
     data_cols = sm.opt.io.profile_values
     ncols = length(data_cols)
-    dataset_name = "newton_$(lpad(model_number_for_write, sm.opt.io.hdf5_profile_dataset_name_zero_padding, "0"))_$(lpad(newton_iter, sm.opt.io.hdf5_profile_newton_iter_zero_padding, "0"))"
+    dataset_name = "newton_$(lpad(next_model_number, sm.opt.io.hdf5_profile_dataset_name_zero_padding, "0"))_$(lpad(newton_iter, sm.opt.io.hdf5_profile_newton_iter_zero_padding, "0"))"
 
     if haskey(sm.profiles_file, dataset_name)
         if !sm.opt.io.hdf5_profile_keep_open
@@ -297,10 +297,10 @@ function write_newton_iteration_data(sm::StellarModel, newton_iter::Int)
 
     attrs(profile)["column_units"] = [sm.profile_output_units[data_cols[i]] for i in eachindex(data_cols)]
     attrs(profile)["column_names"] = [data_cols[i] for i in eachindex(data_cols)]
-    attrs(profile)["model_number"] = model_number_for_write
+    attrs(profile)["model_number"] = next_model_number
     attrs(profile)["newton_iter"] = newton_iter
 
-    for i in eachindex(data_cols), k = 1:(sm.props.nz)
+    for k = 1:(sm.props.nz), i in eachindex(data_cols)
         profile[k, i] = sm.profile_output_functions[data_cols[i]](sm, k)
     end
 
