@@ -168,6 +168,11 @@ function setup_model_profile_functions!(sm::StellarModel)
     add_profile_option!(sm, "nabla_r_face", "unitless", (sm, k) -> get_value(sm.props.turb_res[k].∇ᵣ), label=L"\nabla_\text{r,face}")
     add_profile_option!(sm, "nabla_face", "unitless", (sm, k) -> get_value(sm.props.turb_res[k].∇), label=L"\nabla_\text{face}")
     add_profile_option!(sm, "D_face", "cm^2*s^{-1}", (sm, k) -> get_value(sm.props.turb_res[k].D_turb), label=L"D_\text{face}\,[\text{cm^2\,s^{-1}}]")
+
+    # solver diagnostics
+    add_profile_option!(sm, "residual_continuity", "unitless", (sm, k) -> sm.solver_data.eqs_numbers[(k - 1) * sm.nvars + 3], label=L"\mathcal{R}_\text{continuity}")
+    add_profile_option!(sm, "correction_lnrho", "unitless", (sm, k) -> sm.solver_data.solver_corr[(k - 1) * sm.nvars + sm.vari[:lnρ]], label=L"\Delta\ln\rho")
+    add_profile_option!(sm, "correction_lnr", "unitless", (sm, k) -> sm.solver_data.solver_corr[(k - 1) * sm.nvars + sm.vari[:lnr]], label=L"\Delta\ln r")
 end
 
 function init_IO(m::AbstractModel)

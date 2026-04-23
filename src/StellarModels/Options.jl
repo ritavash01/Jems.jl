@@ -93,7 +93,7 @@ Substructure of Options containing controls relating to input/output of data
                                       "X_center", "Y_center"]
 
     profile_values::Vector{String} = ["zone", "mass", "dm", "log10_rho", "log10_r", "log10_P", "log10_T", "luminosity",
-                                      "X", "Y"]
+                                      "X", "Y", "residual_continuity", "correction_lnrho", "correction_lnr"]
 end
 
 """
