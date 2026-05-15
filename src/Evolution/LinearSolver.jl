@@ -207,7 +207,7 @@ function block_tridiagonal_solver!(sm, ::StellarModels.ThomasSolverData)
             x_even .= level_b[k]
             mul!(tmp_vec, level_L[k], x_odd[k])
             x_even .-= tmp_vec
-            if 2 * k + 1 <= n_level
+            if k + 1 <= n_odd
                 mul!(tmp_vec, level_U[k], x_odd[k+1])
                 x_even .-= tmp_vec
             end
