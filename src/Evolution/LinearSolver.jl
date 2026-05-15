@@ -188,7 +188,7 @@ function block_tridiagonal_solver!(sm, ::StellarModels.ThomasSolverData)
 
     x_odd = solver_x
     x_full_buffer = solver_β # reuse RHS buffer for reconstructed full solution at each level
-    x_odd_is_solver_x = true
+    x_odd_is_solver_x = true # toggled each level when swapping buffers
 
     for level_index in length(sm.solver_data.cr_levels):-1:1
         n_level = sm.solver_data.cr_levels[level_index]
