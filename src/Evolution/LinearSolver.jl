@@ -216,7 +216,7 @@ function block_tridiagonal_solver!(sm, ::StellarModels.ThomasSolverData)
         x_odd, x_full = x_full, x_odd
     end
 
-    if x_odd !== solver_x
+    if x_odd !== solver_x # buffers swapped; copy back into solver_x for downstream consumers
         for i in 1:n_original
             solver_x[i] .= x_odd[i]
         end
