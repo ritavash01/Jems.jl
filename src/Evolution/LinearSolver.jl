@@ -135,7 +135,7 @@ function block_tridiagonal_solver!(sm, ::StellarModels.ThomasSolverData)
         )
 
         for k in 1:n_even
-            i = 2k
+            i = 2 * k
             LU = lu!(jacobian_D[i])
             if i > 1
                 ldiv!(level_L[k], LU, jacobian_L[i])
@@ -151,7 +151,7 @@ function block_tridiagonal_solver!(sm, ::StellarModels.ThomasSolverData)
         end
 
         for k in 1:n_odd
-            i = 2k - 1
+            i = 2 * k - 1
             D_next = jacobian_D[k]
             L_next = jacobian_L[k]
             U_next = jacobian_U[k]
@@ -206,11 +206,11 @@ function block_tridiagonal_solver!(sm, ::StellarModels.ThomasSolverData)
         level_b = sm.solver_data.cr_even_b[level_index]
 
         for k in 1:n_odd
-            x_full[2k-1] .= x_odd[k]
+            x_full[2 * k - 1] .= x_odd[k]
         end
 
         for k in 1:n_even
-            i = 2k
+            i = 2 * k
             x_even = x_full[i]
             x_even .= level_b[k]
             mul!(tmp_vec, level_L[k], x_odd[k])
