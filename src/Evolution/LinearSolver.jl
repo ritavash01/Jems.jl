@@ -154,12 +154,12 @@ function block_tridiagonal_solver!(sm, ::StellarModels.ThomasSolverData)
 
             if i > 1
                 L_i = jacobian_L[i]
-                left = k - 1
-                mul!(tmp_mat, L_i, level_U[left])
+                left_even_index = k - 1
+                mul!(tmp_mat, L_i, level_U[left_even_index])
                 D_next .-= tmp_mat
-                mul!(tmp_mat, L_i, level_L[left])
+                mul!(tmp_mat, L_i, level_L[left_even_index])
                 L_next .= -tmp_mat
-                mul!(tmp_vec, L_i, level_b[left])
+                mul!(tmp_vec, L_i, level_b[left_even_index])
                 b_next .-= tmp_vec
             else
                 fill!(L_next, 0)
@@ -167,12 +167,12 @@ function block_tridiagonal_solver!(sm, ::StellarModels.ThomasSolverData)
 
             if i < n
                 U_i = jacobian_U[i]
-                right = k
-                mul!(tmp_mat, U_i, level_L[right])
+                right_even_index = k
+                mul!(tmp_mat, U_i, level_L[right_even_index])
                 D_next .-= tmp_mat
-                mul!(tmp_mat, U_i, level_U[right])
+                mul!(tmp_mat, U_i, level_U[right_even_index])
                 U_next .= -tmp_mat
-                mul!(tmp_vec, U_i, level_b[right])
+                mul!(tmp_vec, U_i, level_b[right_even_index])
                 b_next .-= tmp_vec
             else
                 fill!(U_next, 0)
@@ -186,7 +186,7 @@ function block_tridiagonal_solver!(sm, ::StellarModels.ThomasSolverData)
     ldiv!(solver_x[1], LU, solver_β[1])
 
     x_odd = solver_x
-    x_full = solver_β
+    x_full = solver_β # reuse RHS buffer for reconstructed full solution at each level
 
     for level_index in length(sm.solver_data.cr_levels):-1:1
         n_level = sm.solver_data.cr_levels[level_index]
