@@ -15,6 +15,10 @@ abstract type AbstractSolverData end
     solver_x::Vector{TVECTOR}
     solver_corr::Vector{TNUMBER}
     preconditioning_factor::Vector{TNUMBER}
+    cr_even_L::Vector{Vector{TMATRIX}}
+    cr_even_U::Vector{Vector{TMATRIX}}
+    cr_even_b::Vector{Vector{TVECTOR}}
+    cr_levels::Vector{Int}
     newton_iters::Int
     use_static_arrays::Bool
 end
@@ -61,6 +65,10 @@ function ThomasSolverData(nvars, nz, nextra, use_static_arrays, number_type)
     eqs_numbers = ones(number_type, nvars * (nz+nextra))
 
     preconditioning_factor = ones(number_type, nvars * (nz+nextra))
+    cr_even_L = Vector{Vector{typeof(jacobian_D[1])}}()
+    cr_even_U = Vector{Vector{typeof(jacobian_D[1])}}()
+    cr_even_b = Vector{Vector{typeof(solver_β[1])}}()
+    cr_levels = Int[]
 
     ThomasSolverData(eqs_numbers = eqs_numbers,
                      eqs_duals = eqs_duals,
@@ -74,6 +82,10 @@ function ThomasSolverData(nvars, nz, nextra, use_static_arrays, number_type)
                      solver_x = solver_x,
                      solver_corr = solver_corr,
                      preconditioning_factor = preconditioning_factor,
+                     cr_even_L = cr_even_L,
+                     cr_even_U = cr_even_U,
+                     cr_even_b = cr_even_b,
+                     cr_levels = cr_levels,
                      newton_iters = 0,
                      use_static_arrays = use_static_arrays)
 end

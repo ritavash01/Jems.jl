@@ -1,20 +1,43 @@
 using LinearAlgebra
 
 ##
-# Thomas algorithm, taken from
-# BCYCLIC: A parallel block tridiagonal matrix cyclic solver
-# Hishman et al. 2010
-# This is not BCYCLIC, but their description of the Thomas
-# algorithm for block tridiagonal systems. Beware there are typos
-# in their equations (3a) and (3b)
+# Bicyclic (cyclic reduction) algorithm following
+# BCYCLIC: A parallel block tridiagonal matrix cyclic solver (Hirshman et al. 2010)
+function ensure_cyclic_level_storage!(solver_data, level, n_even, matrix_sample, vector_sample)
+    while length(solver_data.cr_even_L) < level
+        push!(solver_data.cr_even_L, Vector{typeof(matrix_sample)}())
+        push!(solver_data.cr_even_U, Vector{typeof(matrix_sample)}())
+        push!(solver_data.cr_even_b, Vector{typeof(vector_sample)}())
+    end
+
+    level_L = solver_data.cr_even_L[level]
+    level_U = solver_data.cr_even_U[level]
+    level_b = solver_data.cr_even_b[level]
+
+    resize!(level_L, n_even)
+    resize!(level_U, n_even)
+    resize!(level_b, n_even)
+
+    for i in 1:n_even
+        if !isassigned(level_L, i)
+            level_L[i] = similar(matrix_sample)
+        end
+        if !isassigned(level_U, i)
+            level_U[i] = similar(matrix_sample)
+        end
+        if !isassigned(level_b, i)
+            level_b[i] = similar(vector_sample)
+        end
+    end
+    return level_L, level_U, level_b
+end
+
 function block_tridiagonal_solver!(sm, ::StellarModels.ThomasSolverData)
     eqs_numbers = sm.solver_data.eqs_numbers
-    solver_LU = sm.solver_data.solver_LU
     jacobian_D = sm.solver_data.jacobian_D
     jacobian_L = sm.solver_data.jacobian_L
     jacobian_U = sm.solver_data.jacobian_U
     solver_tmp1 = sm.solver_data.solver_tmp1
-    solver_tmp2 = sm.solver_data.solver_tmp2
     solver_x = sm.solver_data.solver_x
     solver_β = sm.solver_data.solver_β
     solver_corr = sm.solver_data.solver_corr
@@ -85,55 +108,133 @@ function block_tridiagonal_solver!(sm, ::StellarModels.ThomasSolverData)
         sm.solver_data.preconditioning_factor .= 1.0
     end
 
-    # We store Δ_i in the diagonal
-    b_1 = @view eqs_numbers[1:sm.nvars]
-    solver_β[1] .= .- b_1  # this has an inverse sign for b_1 for our case
-    # Δ_0 is just the inverse of the first diagonal block
-    D_1 = jacobian_D[1]
-    solver_LU[1] = lu!(D_1)
-    for i=2:sm.props.nz
-        # update β first
-        L_i = jacobian_L[i]
-        LU_Δ_im1 = solver_LU[i-1] # we have stored the LU factorization of Δ for previous zone here
-        b_i = @view eqs_numbers[(i-1)*sm.nvars+1:i*sm.nvars]
-        β_i = solver_β[i]
-        β_im1 = solver_β[i-1]
-        ldiv!(solver_x[i], LU_Δ_im1, β_im1) #sm.solver_x[i] is only used as placeholder here
-        mul!(β_i, L_i, solver_x[i]) # here also β_i is a placeholder
-        for j in 1:sm.nvars
-            β_i[j] = -b_i[j] - β_i[j]
+    n = sm.props.nz
+    nvars = sm.nvars
+    n_original = n
+
+    for i in 1:n
+        for j in 1:nvars
+            solver_β[i][j] = -eqs_numbers[(i-1)*nvars + j]
+        end
+    end
+
+    empty!(sm.solver_data.cr_levels)
+
+    tmp_mat = solver_tmp1[1]
+    tmp_vec = similar(solver_β[1])
+
+    level = 0
+    while n > 1
+        level += 1
+        push!(sm.solver_data.cr_levels, n)
+        n_even = n ÷ 2
+        n_odd = n - n_even
+
+        level_L, level_U, level_b = ensure_cyclic_level_storage!(
+            sm.solver_data, level, n_even, jacobian_D[1], solver_β[1]
+        )
+
+        for k in 1:n_even
+            i = 2k
+            LU = lu!(jacobian_D[i])
+            if i > 1
+                ldiv!(level_L[k], LU, jacobian_L[i])
+            else
+                fill!(level_L[k], 0)
+            end
+            if i < n
+                ldiv!(level_U[k], LU, jacobian_U[i])
+            else
+                fill!(level_U[k], 0)
+            end
+            ldiv!(level_b[k], LU, solver_β[i])
         end
 
-        # update Δ next
-        D_i = jacobian_D[i]
-        U_im1 = jacobian_U[i-1]
-        ldiv!(solver_tmp1[i], LU_Δ_im1, U_im1)
-        mul!(solver_tmp2[i], L_i, solver_tmp1[i])
-        D_i .= D_i .- solver_tmp2[i]
-        solver_LU[i] = lu!(D_i)
+        for k in 1:n_odd
+            i = 2k - 1
+            D_next = jacobian_D[k]
+            L_next = jacobian_L[k]
+            U_next = jacobian_U[k]
+            b_next = solver_β[k]
+
+            copyto!(D_next, jacobian_D[i])
+            copyto!(b_next, solver_β[i])
+
+            if i > 1
+                L_i = jacobian_L[i]
+                left = k - 1
+                mul!(tmp_mat, L_i, level_U[left])
+                D_next .-= tmp_mat
+                mul!(tmp_mat, L_i, level_L[left])
+                L_next .= -tmp_mat
+                mul!(tmp_vec, L_i, level_b[left])
+                b_next .-= tmp_vec
+            else
+                fill!(L_next, 0)
+            end
+
+            if i < n
+                U_i = jacobian_U[i]
+                right = k
+                mul!(tmp_mat, U_i, level_L[right])
+                D_next .-= tmp_mat
+                mul!(tmp_mat, U_i, level_U[right])
+                U_next .= -tmp_mat
+                mul!(tmp_vec, U_i, level_b[right])
+                b_next .-= tmp_vec
+            else
+                fill!(U_next, 0)
+            end
+        end
+
+        n = n_odd
     end
 
-    x_N = solver_x[sm.props.nz]
-    LU_Δ_N = solver_LU[sm.props.nz]
-    β_N = solver_β[sm.props.nz] 
-    ldiv!(x_N, LU_Δ_N, β_N)
-    # backwards sweep
-    for i=sm.props.nz-1:-1:1
-        x_i = solver_x[i]
-        x_ip1 = solver_x[i+1]
-        β_i = solver_β[i]
-        U_i = jacobian_U[i]
-        LU_Δ_i = solver_LU[i]
+    LU = lu!(jacobian_D[1])
+    ldiv!(solver_x[1], LU, solver_β[1])
 
-        mul!(x_i,U_i,x_ip1)
-        β_i .= β_i .- x_i
-        ldiv!(x_i, LU_Δ_i, β_i)
+    x_odd = solver_x
+    x_full = solver_β
+
+    for level_index in length(sm.solver_data.cr_levels):-1:1
+        n_level = sm.solver_data.cr_levels[level_index]
+        n_even = n_level ÷ 2
+        n_odd = n_level - n_even
+
+        level_L = sm.solver_data.cr_even_L[level_index]
+        level_U = sm.solver_data.cr_even_U[level_index]
+        level_b = sm.solver_data.cr_even_b[level_index]
+
+        for k in 1:n_odd
+            x_full[2k-1] .= x_odd[k]
+        end
+
+        for k in 1:n_even
+            i = 2k
+            x_even = x_full[i]
+            x_even .= level_b[k]
+            mul!(tmp_vec, level_L[k], x_odd[k])
+            x_even .-= tmp_vec
+            if k + 1 <= n_odd
+                mul!(tmp_vec, level_U[k], x_odd[k+1])
+                x_even .-= tmp_vec
+            end
+        end
+
+        x_odd, x_full = x_full, x_odd
     end
+
+    if x_odd !== solver_x
+        for i in 1:n_original
+            solver_x[i] .= x_odd[i]
+        end
+    end
+
     # unload result into solver_corr
-    for i=1:sm.props.nz
-        for j=1:sm.nvars
-            solver_corr[(i-1)*sm.nvars+j] = solver_x[i][j] * 
-                sm.solver_data.preconditioning_factor[(i-1)*sm.nvars + j]
+    for i=1:n_original
+        for j=1:nvars
+            solver_corr[(i-1)*nvars+j] = solver_x[i][j] *
+                sm.solver_data.preconditioning_factor[(i-1)*nvars + j]
         end
     end
     return
