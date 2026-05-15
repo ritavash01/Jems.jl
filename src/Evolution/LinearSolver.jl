@@ -154,12 +154,12 @@ function block_tridiagonal_solver!(sm, ::StellarModels.ThomasSolverData)
 
             if i > 1
                 L_i = jacobian_L[i]
-                left_even_index = k - 1
-                mul!(tmp_mat, L_i, level_U[left_even_index])
+                prev_even_idx = k - 1
+                mul!(tmp_mat, L_i, level_U[prev_even_idx])
                 D_next .-= tmp_mat
-                mul!(tmp_mat, L_i, level_L[left_even_index])
+                mul!(tmp_mat, L_i, level_L[prev_even_idx])
                 L_next .= -tmp_mat
-                mul!(tmp_vec, L_i, level_b[left_even_index])
+                mul!(tmp_vec, L_i, level_b[prev_even_idx])
                 b_next .-= tmp_vec
             else
                 fill!(L_next, 0)
@@ -167,12 +167,12 @@ function block_tridiagonal_solver!(sm, ::StellarModels.ThomasSolverData)
 
             if i < n
                 U_i = jacobian_U[i]
-                right_even_index = k
-                mul!(tmp_mat, U_i, level_L[right_even_index])
+                next_even_idx = k
+                mul!(tmp_mat, U_i, level_L[next_even_idx])
                 D_next .-= tmp_mat
-                mul!(tmp_mat, U_i, level_U[right_even_index])
+                mul!(tmp_mat, U_i, level_U[next_even_idx])
                 U_next .= -tmp_mat
-                mul!(tmp_vec, U_i, level_b[right_even_index])
+                mul!(tmp_vec, U_i, level_b[next_even_idx])
                 b_next .-= tmp_vec
             else
                 fill!(U_next, 0)
@@ -187,6 +187,7 @@ function block_tridiagonal_solver!(sm, ::StellarModels.ThomasSolverData)
 
     x_odd = solver_x
     x_full = solver_β # reuse RHS buffer for reconstructed full solution at each level
+    x_odd_is_solver_x = true
 
     for level_index in length(sm.solver_data.cr_levels):-1:1
         n_level = sm.solver_data.cr_levels[level_index]
@@ -214,9 +215,10 @@ function block_tridiagonal_solver!(sm, ::StellarModels.ThomasSolverData)
         end
 
         x_odd, x_full = x_full, x_odd
+        x_odd_is_solver_x = !x_odd_is_solver_x
     end
 
-    if x_odd !== solver_x # buffers swapped; copy back into solver_x for downstream consumers
+    if !x_odd_is_solver_x # buffers swapped; copy back into solver_x for downstream consumers
         for i in 1:n_original
             solver_x[i] .= x_odd[i]
         end
