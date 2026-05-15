@@ -15,9 +15,9 @@ abstract type AbstractSolverData end
     solver_x::Vector{TVECTOR}
     solver_corr::Vector{TNUMBER}
     preconditioning_factor::Vector{TNUMBER}
-    cr_even_L::Vector{Vector{TMATRIX}} # per-level L̂ blocks for even rows (outer index = level)
-    cr_even_U::Vector{Vector{TMATRIX}} # per-level Û blocks for even rows (outer index = level)
-    cr_even_b::Vector{Vector{TVECTOR}} # per-level b̂ vectors for even rows (outer index = level)
+    cr_even_L::Vector{Vector{TMATRIX}} # per-level modified lower blocks for even rows (outer index = level)
+    cr_even_U::Vector{Vector{TMATRIX}} # per-level modified upper blocks for even rows (outer index = level)
+    cr_even_b::Vector{Vector{TVECTOR}} # per-level modified RHS vectors for even rows (outer index = level)
     cr_levels::Vector{Int} # number of rows at each cyclic reduction level
     newton_iters::Int
     use_static_arrays::Bool

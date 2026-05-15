@@ -136,7 +136,8 @@ function block_tridiagonal_solver!(sm, ::StellarModels.ThomasSolverData)
 
         for k in 1:n_even
             i = 2 * k
-            # safe to factor in place: even-row diagonals are not reused after this stage
+            # safe to factor in place: even-row diagonals are not reused after this stage and
+            # the Jacobian is rebuilt each Newton step, so destructive updates are acceptable
             LU = lu!(jacobian_D[i])
             ldiv!(level_L[k], LU, jacobian_L[i])
             ldiv!(level_U[k], LU, jacobian_U[i])
@@ -187,8 +188,10 @@ function block_tridiagonal_solver!(sm, ::StellarModels.ThomasSolverData)
     ldiv!(solver_x[1], LU, solver_β[1])
 
     x_odd = solver_x
-    x_full_buffer = solver_β # reuse RHS buffer for reconstructed full solution at each level
-    x_odd_is_solver_x = true # toggled each level when swapping buffers
+    # reuse RHS buffer for reconstructed full solution at each level (RHS no longer needed after reduction)
+    x_full_buffer = solver_β
+    # track which buffer currently holds the odd-indexed solution as we swap buffers each level
+    x_odd_is_solver_x = true
 
     for level_index in length(sm.solver_data.cr_levels):-1:1
         n_level = sm.solver_data.cr_levels[level_index]
@@ -215,6 +218,7 @@ function block_tridiagonal_solver!(sm, ::StellarModels.ThomasSolverData)
             end
         end
 
+        # after each level, the reconstructed full solution becomes the odd-indexed solution for the next level
         x_odd, x_full_buffer = x_full_buffer, x_odd
         x_odd_is_solver_x = !x_odd_is_solver_x
     end
